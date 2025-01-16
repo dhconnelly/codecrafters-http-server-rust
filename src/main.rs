@@ -2,11 +2,7 @@ use clap::Parser;
 use std::{
     io::{self, Write},
     net::{TcpListener, TcpStream},
-    os::fd::AsRawFd,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
-    },
+    sync::Mutex,
     time::Duration,
 };
 
@@ -42,7 +38,7 @@ impl Connection {
     fn new(config: &Config, stream: TcpStream) -> Result<Self, io::Error> {
         stream.set_write_timeout(Some(Duration::from_millis(config.write_timeout_ms)))?;
         stream.set_read_timeout(Some(Duration::from_millis(config.read_timeout_ms)))?;
-        return Ok(Self { stream });
+        Ok(Self { stream })
     }
 
     fn handle(&mut self) {
