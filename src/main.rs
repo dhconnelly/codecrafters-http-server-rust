@@ -1,8 +1,11 @@
 use clap::Parser;
 use std::{
-    io::{self, Write},
+    error::Error,
+    fmt::Display,
+    io::{self, BufRead, BufReader, BufWriter, Read},
     net::{TcpListener, TcpStream},
-    sync::Mutex,
+    str::FromStr,
+    sync::{Mutex, OnceLock},
     time::Duration,
 };
 
@@ -34,6 +37,52 @@ struct Connection {
     stream: TcpStream,
 }
 
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum Status {
+    InvalidRequest = 400,
+}
+
+trait HttpError {
+    fn status(&self) -> Status;
+}
+
+#[derive(Debug)]
+struct Request {
+    path: String,
+}
+
+#[derive(Debug)]
+struct RequestParsingError;
+
+impl HttpError for RequestParsingError {
+    fn status(&self) -> Status {
+        Status::InvalidRequest
+    }
+}
+
+impl Display for RequestParsingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "failed to parse request")
+    }
+}
+
+impl Error for RequestParsingError {}
+
+fn request_path_re() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new("^GET (/[^ ]*) HTTP/1.1$").unwrap())
+}
+
+impl FromStr for Request {
+    type Err = RequestParsingError;
+    fn from_str(request_line: &str) -> Result<Self, Self::Err> {
+        let re = request_path_re();
+        let caps = re.captures(request_line).ok_or(RequestParsingError)?;
+        let path = caps.get(1).ok_or(RequestParsingError)?.as_str().to_owned();
+        Ok(Request { path })
+    }
+}
+
 impl Connection {
     fn new(config: &Config, stream: TcpStream) -> Result<Self, io::Error> {
         stream.set_write_timeout(Some(Duration::from_millis(config.write_timeout_ms)))?;
@@ -42,10 +91,27 @@ impl Connection {
     }
 
     fn handle(&mut self) {
-        let s = &mut self.stream;
-        if let Err(err) = write!(s, "HTTP/1.1 200 OK\r\n\r\n") {
-            eprintln!("client {}: error: {}", s.peer_addr().unwrap(), err);
-        }
+        let mut w = BufWriter::new(&self.stream);
+        let r = BufReader::new(&self.stream);
+        let mut lines = BufReader::new(r).lines();
+
+        let request_line = match lines.next() {
+            Some(Ok(line)) => line,
+            _ => {
+                eprintln!("failed to read request line");
+                return;
+            }
+        };
+
+        let request = match Request::from_str(&request_line) {
+            Ok(request) => request,
+            _ => {
+                eprintln!("failed to parse request");
+                return;
+            }
+        };
+
+        println!("{}: {}", self.stream.peer_addr().unwrap(), "OK");
     }
 }
 
@@ -61,6 +127,15 @@ struct Server {
     addr: String,
     listener: TcpListener,
     state: Mutex<ServerState>,
+}
+
+struct Response {
+    status: Status,
+    body: Box<dyn Read>,
+}
+
+trait Handler {
+    fn handle(&self, req: &Request) -> Result<Response, Box<dyn HttpError>>;
 }
 
 impl Server {
@@ -83,6 +158,10 @@ impl Server {
         let _ = TcpStream::connect(&self.addr);
     }
 
+    fn handle(&self, stream: TcpStream) -> io::Result<()> {
+        Ok(Connection::new(&self.config, stream)?.handle())
+    }
+
     fn listen(&self) -> io::Result<()> {
         {
             let mut guard = self.state.lock().unwrap();
@@ -96,7 +175,7 @@ impl Server {
                 break;
             }
             match stream {
-                Ok(stream) => Connection::new(&self.config, stream)?.handle(),
+                Ok(stream) => self.handle(stream)?,
                 Err(err) => return Err(err),
             }
         }
@@ -111,6 +190,7 @@ impl Server {
 fn main() {
     let config = Config::parse();
     let server = Server::start(config);
+    println!("listening at http://{}", server.addr);
     server.listen().expect("failure");
 }
 
