@@ -1,8 +1,12 @@
 use clap::Parser;
 use std::{
-    io,
-    io::Write,
+    io::{self, Write},
     net::{TcpListener, TcpStream},
+    os::fd::AsRawFd,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
@@ -19,8 +23,15 @@ struct Config {
     read_timeout_ms: u64,
 }
 
-struct Server {
-    config: Config,
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            host: String::from("127.0.0.1"),
+            port: 0,
+            write_timeout_ms: 1000,
+            read_timeout_ms: 1000,
+        }
+    }
 }
 
 struct Connection {
@@ -42,31 +53,100 @@ impl Connection {
     }
 }
 
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum ServerState {
+    Stopped,
+    Running,
+    Stopping,
+}
+
+struct Server {
+    config: Config,
+    addr: String,
+    listener: TcpListener,
+    state: Mutex<ServerState>,
+}
+
 impl Server {
-    fn new(config: Config) -> Self {
-        Self { config }
-    }
-
-    fn handle(&self, stream: TcpStream) -> io::Result<()> {
-        Ok(Connection::new(&self.config, stream)?.handle())
-    }
-
-    fn run(&mut self) -> Result<(), io::Error> {
-        let addr = format!("{}:{}", self.config.host, self.config.port);
+    fn start(config: Config) -> Self {
+        let addr = format!("{}:{}", config.host, config.port);
         let listener = TcpListener::bind(&addr).unwrap();
-        println!("listening at http://{}", addr);
-        for stream in listener.incoming() {
+        let addr = listener.local_addr().unwrap().to_string();
+        let state = Mutex::new(ServerState::Stopped);
+        Self { config, listener, addr, state }
+    }
+
+    fn stop(&self) {
+        {
+            let mut guard = self.state.lock().unwrap();
+            if *guard != ServerState::Running {
+                return;
+            }
+            *guard = ServerState::Stopping;
+        }
+        let _ = TcpStream::connect(&self.addr);
+    }
+
+    fn listen(&self) -> io::Result<()> {
+        {
+            let mut guard = self.state.lock().unwrap();
+            if *guard != ServerState::Stopped {
+                return Ok(());
+            }
+            *guard = ServerState::Running;
+        }
+        for stream in self.listener.incoming() {
+            if *self.state.lock().unwrap() == ServerState::Stopping {
+                break;
+            }
             match stream {
-                Ok(stream) => self.handle(stream)?,
+                Ok(stream) => Connection::new(&self.config, stream)?.handle(),
                 Err(err) => return Err(err),
             }
+        }
+        {
+            let mut guard = self.state.lock().unwrap();
+            *guard = ServerState::Stopped;
         }
         Ok(())
     }
 }
 
 fn main() {
-    let cli = Config::parse();
-    let mut server = Server::new(cli);
-    server.run().expect("server failed");
+    let config = Config::parse();
+    let server = Server::start(config);
+    server.listen().expect("failure");
+}
+
+#[cfg(test)]
+mod test {
+    use std::{sync::Arc, thread};
+
+    use super::*;
+
+    #[test]
+    fn test_foo() {
+        for _ in 0..10 {
+            let config = Config::default();
+            let server = Arc::new(Server::start(config));
+            let addr = server.addr.clone();
+
+            for _ in 0..10 {
+                let server2 = Arc::clone(&server);
+                let handle = thread::spawn(move || server2.listen());
+
+                for _ in 0..10 {
+                    // try connecting
+                    let conn = TcpStream::connect(&addr);
+                    assert!(conn.is_ok());
+                    // let resp = reqwest::blocking::get(&addr).unwrap();
+                    // assert!(resp.status().is_success());
+                    // assert_eq!(resp.text().unwrap(), "");
+                }
+
+                server.stop();
+                handle.join().unwrap().expect("server failed");
+            }
+        }
+    }
 }
