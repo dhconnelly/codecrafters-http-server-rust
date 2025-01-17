@@ -5,7 +5,6 @@ use std::{
     fmt::Display,
     io::{self, BufRead, BufReader, BufWriter, Cursor, Read, Write},
     net::{TcpListener, TcpStream},
-    ops::DerefMut,
     sync::{Mutex, OnceLock},
     time::Duration,
 };
@@ -34,10 +33,6 @@ impl Default for Config {
     }
 }
 
-struct Connection {
-    stream: TcpStream,
-}
-
 #[derive(Debug)]
 struct ConnectionError(String);
 
@@ -57,7 +52,7 @@ impl From<io::Error> for ConnectionError {
 }
 
 impl From<RequestParsingError> for ConnectionError {
-    fn from(err: RequestParsingError) -> Self {
+    fn from(_err: RequestParsingError) -> Self {
         Self(format!("failed to parse request"))
     }
 }
@@ -89,6 +84,17 @@ fn write_status(writer: &mut dyn Write, status: HttpStatus) -> Result<(), Connec
     Ok(write!(writer, "HTTP/1.1 {}\r\n", status)?)
 }
 
+fn write_content_type(writer: &mut dyn Write, content_type: &str) -> Result<(), ConnectionError> {
+    Ok(write!(writer, "Content-Type: {}\r\n", content_type)?)
+}
+
+fn write_content_length(
+    writer: &mut dyn Write,
+    content_length: usize,
+) -> Result<(), ConnectionError> {
+    Ok(write!(writer, "Content-Length: {}\r\n", content_length)?)
+}
+
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum ServerState {
     Stopped,
@@ -99,14 +105,12 @@ enum ServerState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HttpStatus {
     OK,
-    BadRequest,
     NotFound,
 }
 
 impl HttpStatus {
     fn code(self) -> u16 {
         match self {
-            HttpStatus::BadRequest => 400,
             HttpStatus::NotFound => 404,
             HttpStatus::OK => 200,
         }
@@ -116,7 +120,6 @@ impl HttpStatus {
 impl Display for HttpStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let message = match self {
-            HttpStatus::BadRequest => "400 Bad Request",
             HttpStatus::NotFound => "404 Not Found",
             HttpStatus::OK => "200 OK",
         };
@@ -137,9 +140,21 @@ impl Error for HttpError {}
 
 type HttpResult = Result<Response, HttpError>;
 
+struct Body {
+    data: Box<dyn Read>,
+    content_length: usize,
+    content_type: String,
+}
+
+impl Body {
+    fn plain_text(data: Box<dyn Read>, content_length: usize) -> Option<Self> {
+        Some(Self { data, content_type: String::from("text/plain"), content_length })
+    }
+}
+
 struct Response {
     status: HttpStatus,
-    body: Option<Box<dyn Read>>,
+    body: Option<Body>,
 }
 
 trait Handler: Send + Sync {
@@ -155,8 +170,7 @@ impl From<NoopHandler> for Box<dyn Handler> {
 }
 
 impl Handler for NoopHandler {
-    fn handle(&self, req: Request) -> Result<Response, HttpError> {
-        let data: &[u8] = &[];
+    fn handle(&self, _req: Request) -> Result<Response, HttpError> {
         Ok(Response { status: HttpStatus::OK, body: None })
     }
 }
@@ -234,11 +248,15 @@ impl Server {
         let response = self.handler.handle(request);
         match response {
             Err(err) => write_status(&mut writer, err.0)?,
-            Ok(resp) => {
+            Ok(mut resp) => {
                 write_status(&mut writer, resp.status)?;
+                if let Some(body) = &mut resp.body {
+                    write_content_type(&mut writer, &body.content_type)?;
+                    write_content_length(&mut writer, body.content_length)?;
+                }
                 write!(writer, "\r\n")?;
-                if let Some(mut body) = resp.body {
-                    io::copy(&mut body, &mut writer)?;
+                if let Some(body) = &mut resp.body {
+                    io::copy(&mut body.data, &mut writer)?;
                 }
             }
         }
@@ -292,8 +310,9 @@ fn main() {
             })
             .route("^/echo/([^/]+)$", |req: Request<'_>| {
                 let message = req.matches.unwrap().swap_remove(1).unwrap();
+                let length = message.len();
                 let body = Box::new(Cursor::new(message.into_bytes()));
-                Ok(Response { status: HttpStatus::OK, body: Some(body) })
+                Ok(Response { status: HttpStatus::OK, body: Body::plain_text(body, length) })
             })
             .build(),
     );
