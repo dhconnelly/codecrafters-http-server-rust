@@ -2,7 +2,7 @@ use clap::Parser;
 use std::{
     error::Error,
     fmt::Display,
-    io::{self, BufRead, BufReader, BufWriter, Read},
+    io::{self, BufRead, BufReader, BufWriter, Read, Write},
     net::{TcpListener, TcpStream},
     rc::Rc,
     str::FromStr,
@@ -36,11 +36,6 @@ impl Default for Config {
 
 struct Connection {
     stream: TcpStream,
-}
-
-#[derive(PartialEq, Eq, Clone, Copy)]
-enum Status {
-    InvalidRequest = 400,
 }
 
 #[derive(Debug)]
@@ -89,6 +84,10 @@ fn parse_path(reader: &mut dyn BufRead) -> Result<String, ConnectionError> {
     Ok(path)
 }
 
+fn write_status(writer: &mut dyn Write, status: HttpStatus) -> Result<(), ConnectionError> {
+    Ok(write!(writer, "HTTP/1.1 {}\r\n", status)?)
+}
+
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum ServerState {
     Stopped,
@@ -103,10 +102,32 @@ struct Server {
     state: Mutex<ServerState>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HttpStatus {
-    OK = 200,
-    BadRequest = 400,
-    NotFound = 404,
+    OK,
+    BadRequest,
+    NotFound,
+}
+
+impl HttpStatus {
+    fn code(self) -> u16 {
+        match self {
+            HttpStatus::BadRequest => 400,
+            HttpStatus::NotFound => 404,
+            HttpStatus::OK => 200,
+        }
+    }
+}
+
+impl Display for HttpStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            HttpStatus::BadRequest => "400 Bad Request",
+            HttpStatus::NotFound => "404 Not Found",
+            HttpStatus::OK => "200 OK",
+        };
+        write!(f, "{}", message)
+    }
 }
 
 trait HttpError: Error {
@@ -154,7 +175,7 @@ impl Server {
     fn handle(&self, stream: io::Result<TcpStream>) -> Result<(), ConnectionError> {
         let stream = stream?;
         let mut reader = BufReader::new(&stream);
-        let writer = BufWriter::new(&stream);
+        let mut writer = BufWriter::new(&stream);
 
         stream.set_write_timeout(Some(Duration::from_millis(self.config.write_timeout_ms)))?;
         stream.set_read_timeout(Some(Duration::from_millis(self.config.read_timeout_ms)))?;
@@ -165,14 +186,8 @@ impl Server {
         let handler = NoopHandler;
         let request = Request { path, body: &mut reader };
         match handler.handle(&request) {
-            Err(err) => {
-                // TODO: write it
-                println!("{}", err);
-            }
-            Ok(resp) => {
-                // TODO: write it
-                println!("{}", "ok");
-            }
+            Err(err) => write_status(&mut writer, err.status())?,
+            Ok(resp) => write_status(&mut writer, resp.status)?,
         }
 
         Ok(())
