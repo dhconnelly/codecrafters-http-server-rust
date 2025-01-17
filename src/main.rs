@@ -229,6 +229,7 @@ impl Server {
             Err(err) => write_status(&mut writer, err.0)?,
             Ok(resp) => write_status(&mut writer, resp.status)?,
         }
+        write!(writer, "\r\n")?;
 
         Ok(())
     }
