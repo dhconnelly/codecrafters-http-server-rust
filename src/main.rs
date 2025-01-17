@@ -42,76 +42,54 @@ enum Status {
     InvalidRequest = 400,
 }
 
-trait HttpError {
-    fn status(&self) -> Status;
-}
-
 #[derive(Debug)]
-struct Request {
-    path: String,
-}
+struct ConnectionError(String);
 
 #[derive(Debug)]
 struct RequestParsingError;
 
-impl HttpError for RequestParsingError {
-    fn status(&self) -> Status {
-        Status::InvalidRequest
-    }
-}
-
-impl Display for RequestParsingError {
+impl Display for ConnectionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "failed to parse request")
+        write!(f, "{}", self.0)
     }
 }
 
-impl Error for RequestParsingError {}
-
-fn request_path_re() -> &'static regex::Regex {
-    static RE: OnceLock<regex::Regex> = OnceLock::new();
-    RE.get_or_init(|| regex::Regex::new("^GET (/[^ ]*) HTTP/1.1$").unwrap())
+impl From<io::Error> for ConnectionError {
+    fn from(err: io::Error) -> Self {
+        Self(format!("io error: {}", err))
+    }
 }
 
-impl FromStr for Request {
-    type Err = RequestParsingError;
-    fn from_str(request_line: &str) -> Result<Self, Self::Err> {
-        let re = request_path_re();
-        let caps = re.captures(request_line).ok_or(RequestParsingError)?;
+impl From<RequestParsingError> for ConnectionError {
+    fn from(err: RequestParsingError) -> Self {
+        Self(format!("failed to parse request"))
+    }
+}
+
+impl Error for ConnectionError {}
+
+// TODO: move R into Box<R>
+#[derive(Debug)]
+struct Request<R> {
+    path: String,
+    body: BufReader<R>,
+}
+
+impl<R: Read> Request<R> {
+    fn pat() -> &'static regex::Regex {
+        static RE: OnceLock<regex::Regex> = OnceLock::new();
+        RE.get_or_init(|| regex::Regex::new("^GET (/[^ ]*) HTTP/1.1\r\n$").unwrap())
+    }
+
+    fn parse(mut reader: BufReader<R>) -> Result<Self, ConnectionError> {
+        let mut line = String::new();
+
+        // path
+        reader.read_line(&mut line)?;
+        let caps = Self::pat().captures(&line).ok_or(RequestParsingError)?;
         let path = caps.get(1).ok_or(RequestParsingError)?.as_str().to_owned();
-        Ok(Request { path })
-    }
-}
 
-impl Connection {
-    fn new(config: &Config, stream: TcpStream) -> Result<Self, io::Error> {
-        stream.set_write_timeout(Some(Duration::from_millis(config.write_timeout_ms)))?;
-        stream.set_read_timeout(Some(Duration::from_millis(config.read_timeout_ms)))?;
-        Ok(Self { stream })
-    }
-
-    fn handle(&mut self) {
-        let mut w = BufWriter::new(&self.stream);
-        let r = BufReader::new(&self.stream);
-        let mut lines = BufReader::new(r).lines();
-
-        let request_line = match lines.next() {
-            Some(Ok(line)) => line,
-            _ => {
-                eprintln!("failed to read request line");
-                return;
-            }
-        };
-
-        let request = match Request::from_str(&request_line) {
-            Ok(request) => request,
-            _ => {
-                eprintln!("failed to parse request");
-                return;
-            }
-        };
-
-        println!("{}: {}", self.stream.peer_addr().unwrap(), "OK");
+        Ok(Self { path, body: reader })
     }
 }
 
@@ -129,13 +107,23 @@ struct Server {
     state: Mutex<ServerState>,
 }
 
-struct Response {
-    status: Status,
-    body: Box<dyn Read>,
+enum HttpStatus {
+    OK = 200,
+    BadRequest = 400,
+    NotFound = 404,
+}
+
+trait HttpError: Error {
+    fn status(&self) -> HttpStatus;
+}
+
+struct Response<R: Read> {
+    status: HttpStatus,
+    body: R,
 }
 
 trait Handler {
-    fn handle(&self, req: &Request) -> Result<Response, Box<dyn HttpError>>;
+    fn handle<In: Read, Out: Read>(req: &Request<In>) -> Result<Response<Out>, Box<dyn HttpError>>;
 }
 
 impl Server {
@@ -158,8 +146,21 @@ impl Server {
         let _ = TcpStream::connect(&self.addr);
     }
 
-    fn handle(&self, stream: TcpStream) -> io::Result<()> {
-        Ok(Connection::new(&self.config, stream)?.handle())
+    fn handle(&self, stream: io::Result<TcpStream>) -> Result<(), ConnectionError> {
+        let stream = stream?;
+
+        stream.set_write_timeout(Some(Duration::from_millis(self.config.write_timeout_ms)))?;
+        stream.set_read_timeout(Some(Duration::from_millis(self.config.read_timeout_ms)))?;
+
+        let request = Request::parse(BufReader::new(&stream))?;
+        println!(
+            "{}: {}: {}",
+            stream.peer_addr().unwrap(),
+            request.path,
+            "OK"
+        );
+
+        Ok(())
     }
 
     fn listen(&self) -> io::Result<()> {
@@ -174,9 +175,8 @@ impl Server {
             if *self.state.lock().unwrap() == ServerState::Stopping {
                 break;
             }
-            match stream {
-                Ok(stream) => self.handle(stream)?,
-                Err(err) => return Err(err),
+            if let Err(err) = self.handle(stream) {
+                eprintln!("failed to handle connection: {}", err);
             }
         }
         {
