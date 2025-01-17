@@ -4,8 +4,9 @@ use std::{
     fmt::Display,
     io::{self, BufRead, BufReader, BufWriter, Read},
     net::{TcpListener, TcpStream},
+    rc::Rc,
     str::FromStr,
-    sync::{Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
 
@@ -68,29 +69,24 @@ impl From<RequestParsingError> for ConnectionError {
 
 impl Error for ConnectionError {}
 
-// TODO: move R into Box<R>
-#[derive(Debug)]
-struct Request<R> {
+struct Request<'t> {
     path: String,
-    body: BufReader<R>,
+    body: &'t mut dyn BufRead,
 }
 
-impl<R: Read> Request<R> {
-    fn pat() -> &'static regex::Regex {
-        static RE: OnceLock<regex::Regex> = OnceLock::new();
-        RE.get_or_init(|| regex::Regex::new("^GET (/[^ ]*) HTTP/1.1\r\n$").unwrap())
-    }
+fn request_line_pat() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new("^GET (/[^ ]*) HTTP/1.1\r\n$").unwrap())
+}
 
-    fn parse(mut reader: BufReader<R>) -> Result<Self, ConnectionError> {
-        let mut line = String::new();
-
-        // path
-        reader.read_line(&mut line)?;
-        let caps = Self::pat().captures(&line).ok_or(RequestParsingError)?;
-        let path = caps.get(1).ok_or(RequestParsingError)?.as_str().to_owned();
-
-        Ok(Self { path, body: reader })
-    }
+fn parse_path(reader: &mut dyn BufRead) -> Result<String, ConnectionError> {
+    let mut request_line = String::new();
+    reader.read_line(&mut request_line)?;
+    let caps = request_line_pat()
+        .captures(&request_line)
+        .ok_or(RequestParsingError)?;
+    let path = caps.get(1).ok_or(RequestParsingError)?.as_str().to_owned();
+    Ok(path)
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -117,13 +113,22 @@ trait HttpError: Error {
     fn status(&self) -> HttpStatus;
 }
 
-struct Response<R: Read> {
+struct Response {
     status: HttpStatus,
-    body: R,
+    body: Box<dyn Read>,
 }
 
 trait Handler {
-    fn handle<In: Read, Out: Read>(req: &Request<In>) -> Result<Response<Out>, Box<dyn HttpError>>;
+    fn handle(&self, req: &Request) -> Result<Response, Box<dyn HttpError>>;
+}
+
+struct NoopHandler;
+
+impl Handler for NoopHandler {
+    fn handle(&self, req: &Request) -> Result<Response, Box<dyn HttpError>> {
+        let data: &[u8] = &[];
+        Ok(Response { status: HttpStatus::OK, body: Box::new(data) })
+    }
 }
 
 impl Server {
@@ -148,17 +153,27 @@ impl Server {
 
     fn handle(&self, stream: io::Result<TcpStream>) -> Result<(), ConnectionError> {
         let stream = stream?;
+        let mut reader = BufReader::new(&stream);
+        let writer = BufWriter::new(&stream);
 
         stream.set_write_timeout(Some(Duration::from_millis(self.config.write_timeout_ms)))?;
         stream.set_read_timeout(Some(Duration::from_millis(self.config.read_timeout_ms)))?;
 
-        let request = Request::parse(BufReader::new(&stream))?;
-        println!(
-            "{}: {}: {}",
-            stream.peer_addr().unwrap(),
-            request.path,
-            "OK"
-        );
+        let path = parse_path(&mut reader)?;
+        println!("{}: {}: {}", stream.peer_addr().unwrap(), path, "OK");
+
+        let handler = NoopHandler;
+        let request = Request { path, body: &mut reader };
+        match handler.handle(&request) {
+            Err(err) => {
+                // TODO: write it
+                println!("{}", err);
+            }
+            Ok(resp) => {
+                // TODO: write it
+                println!("{}", "ok");
+            }
+        }
 
         Ok(())
     }
