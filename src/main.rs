@@ -3,8 +3,9 @@ use regex::Regex;
 use std::{
     error::Error,
     fmt::Display,
-    io::{self, BufRead, BufReader, BufWriter, Read, Write},
+    io::{self, BufRead, BufReader, BufWriter, Cursor, Read, Write},
     net::{TcpListener, TcpStream},
+    ops::DerefMut,
     sync::{Mutex, OnceLock},
     time::Duration,
 };
@@ -65,6 +66,7 @@ impl Error for ConnectionError {}
 
 struct Request<'t> {
     path: String,
+    matches: Option<Vec<Option<String>>>,
     body: &'t mut dyn BufRead,
 }
 
@@ -137,7 +139,7 @@ type HttpResult = Result<Response, HttpError>;
 
 struct Response {
     status: HttpStatus,
-    body: Box<dyn Read>,
+    body: Option<Box<dyn Read>>,
 }
 
 trait Handler: Send + Sync {
@@ -155,7 +157,7 @@ impl From<NoopHandler> for Box<dyn Handler> {
 impl Handler for NoopHandler {
     fn handle(&self, req: Request) -> Result<Response, HttpError> {
         let data: &[u8] = &[];
-        Ok(Response { status: HttpStatus::OK, body: Box::new(data) })
+        Ok(Response { status: HttpStatus::OK, body: None })
     }
 }
 
@@ -176,9 +178,14 @@ impl Router {
 }
 
 impl Handler for Router {
-    fn handle(&self, req: Request) -> Result<Response, HttpError> {
+    fn handle(&self, mut req: Request) -> Result<Response, HttpError> {
         for (pat, handler) in &self.routes {
-            if pat.is_match(&req.path) {
+            if let Some(caps) = pat.captures(&req.path) {
+                req.matches = Some(
+                    caps.iter()
+                        .map(|x| x.map(|m| m.as_str().to_owned()))
+                        .collect(),
+                );
                 return handler.handle(req);
             }
         }
@@ -223,13 +230,18 @@ impl Server {
         stream.set_read_timeout(Some(Duration::from_millis(self.config.read_timeout_ms)))?;
 
         let path = parse_path(&mut reader)?;
-        let request = Request { path, body: &mut reader };
+        let request = Request { path, body: &mut reader, matches: None };
         let response = self.handler.handle(request);
         match response {
             Err(err) => write_status(&mut writer, err.0)?,
-            Ok(resp) => write_status(&mut writer, resp.status)?,
+            Ok(resp) => {
+                write_status(&mut writer, resp.status)?;
+                write!(writer, "\r\n")?;
+                if let Some(mut body) = resp.body {
+                    io::copy(&mut body, &mut writer)?;
+                }
+            }
         }
-        write!(writer, "\r\n")?;
 
         Ok(())
     }
@@ -276,8 +288,12 @@ fn main() {
         config,
         Router::default()
             .route("^/$", |_req: Request<'_>| {
-                let data: &[u8] = &[];
-                Ok(Response { body: Box::new(data), status: HttpStatus::OK })
+                Ok(Response { body: None, status: HttpStatus::OK })
+            })
+            .route("^/echo/([^/]+)$", |req: Request<'_>| {
+                let message = req.matches.unwrap().swap_remove(1).unwrap();
+                let body = Box::new(Cursor::new(message.into_bytes()));
+                Ok(Response { status: HttpStatus::OK, body: Some(body) })
             })
             .build(),
     );
