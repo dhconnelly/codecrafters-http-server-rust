@@ -1,12 +1,11 @@
 use clap::Parser;
+use regex::Regex;
 use std::{
     error::Error,
     fmt::Display,
     io::{self, BufRead, BufReader, BufWriter, Read, Write},
     net::{TcpListener, TcpStream},
-    rc::Rc,
-    str::FromStr,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Mutex, OnceLock},
     time::Duration,
 };
 
@@ -95,13 +94,6 @@ enum ServerState {
     Stopping,
 }
 
-struct Server {
-    config: Config,
-    addr: String,
-    listener: TcpListener,
-    state: Mutex<ServerState>,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HttpStatus {
     OK,
@@ -130,35 +122,85 @@ impl Display for HttpStatus {
     }
 }
 
-trait HttpError: Error {
-    fn status(&self) -> HttpStatus;
+#[derive(Debug)]
+struct HttpError(HttpStatus);
+
+impl Display for HttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
 }
+
+impl Error for HttpError {}
+
+type HttpResult = Result<Response, HttpError>;
 
 struct Response {
     status: HttpStatus,
     body: Box<dyn Read>,
 }
 
-trait Handler {
-    fn handle(&self, req: &Request) -> Result<Response, Box<dyn HttpError>>;
+trait Handler: Send + Sync {
+    fn handle(&self, req: Request) -> Result<Response, HttpError>;
 }
 
 struct NoopHandler;
 
+impl From<NoopHandler> for Box<dyn Handler> {
+    fn from(value: NoopHandler) -> Self {
+        Box::new(value)
+    }
+}
+
 impl Handler for NoopHandler {
-    fn handle(&self, req: &Request) -> Result<Response, Box<dyn HttpError>> {
+    fn handle(&self, req: Request) -> Result<Response, HttpError> {
         let data: &[u8] = &[];
         Ok(Response { status: HttpStatus::OK, body: Box::new(data) })
     }
 }
 
+#[derive(Default)]
+struct Router {
+    routes: Vec<(regex::Regex, Box<dyn Handler>)>,
+}
+
+impl Router {
+    fn route<H: Into<Box<dyn Handler>>>(mut self, pat: &str, handler: H) -> Self {
+        self.routes.push((Regex::new(pat).unwrap(), handler.into()));
+        self
+    }
+
+    fn build(self) -> Box<Self> {
+        Box::new(self)
+    }
+}
+
+impl Handler for Router {
+    fn handle(&self, req: Request) -> Result<Response, HttpError> {
+        for (pat, handler) in &self.routes {
+            if pat.is_match(&req.path) {
+                return handler.handle(req);
+            }
+        }
+        Err(HttpError(HttpStatus::NotFound))
+    }
+}
+
+struct Server {
+    config: Config,
+    addr: String,
+    listener: TcpListener,
+    state: Mutex<ServerState>,
+    handler: Box<dyn Handler>,
+}
+
 impl Server {
-    fn start(config: Config) -> Self {
+    fn start(config: Config, handler: Box<dyn Handler>) -> Self {
         let addr = format!("{}:{}", config.host, config.port);
         let listener = TcpListener::bind(&addr).unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let state = Mutex::new(ServerState::Stopped);
-        Self { config, listener, addr, state }
+        Self { config, listener, addr, state, handler }
     }
 
     fn stop(&self) {
@@ -181,12 +223,10 @@ impl Server {
         stream.set_read_timeout(Some(Duration::from_millis(self.config.read_timeout_ms)))?;
 
         let path = parse_path(&mut reader)?;
-        println!("{}: {}: {}", stream.peer_addr().unwrap(), path, "OK");
-
-        let handler = NoopHandler;
         let request = Request { path, body: &mut reader };
-        match handler.handle(&request) {
-            Err(err) => write_status(&mut writer, err.status())?,
+        let response = self.handler.handle(request);
+        match response {
+            Err(err) => write_status(&mut writer, err.0)?,
             Ok(resp) => write_status(&mut writer, resp.status)?,
         }
 
@@ -217,9 +257,29 @@ impl Server {
     }
 }
 
+impl<F: Fn(Request) -> HttpResult + Send + Sync + 'static> Handler for F {
+    fn handle(&self, req: Request) -> Result<Response, HttpError> {
+        self(req)
+    }
+}
+
+impl<F: Fn(Request) -> HttpResult + Send + Sync + 'static> From<F> for Box<dyn Handler> {
+    fn from(value: F) -> Self {
+        Box::new(value)
+    }
+}
+
 fn main() {
     let config = Config::parse();
-    let server = Server::start(config);
+    let server = Server::start(
+        config,
+        Router::default()
+            .route("^/$", |_req: Request<'_>| {
+                let data: &[u8] = &[];
+                Ok(Response { body: Box::new(data), status: HttpStatus::OK })
+            })
+            .build(),
+    );
     println!("listening at http://{}", server.addr);
     server.listen().expect("failure");
 }
@@ -234,7 +294,7 @@ mod test {
     fn test_foo() {
         for _ in 0..10 {
             let config = Config::default();
-            let server = Arc::new(Server::start(config));
+            let server = Arc::new(Server::start(config, Box::new(NoopHandler)));
             let addr = server.addr.clone();
 
             for _ in 0..10 {
