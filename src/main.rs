@@ -247,7 +247,10 @@ impl Server {
         let request = Request { path, body: &mut reader, matches: None };
         let response = self.handler.handle(request);
         match response {
-            Err(err) => write_status(&mut writer, err.0)?,
+            Err(err) => {
+                write_status(&mut writer, err.0)?;
+                write!(writer, "\r\n")?;
+            }
             Ok(mut resp) => {
                 write_status(&mut writer, resp.status)?;
                 if let Some(body) = &mut resp.body {
