@@ -2,6 +2,7 @@ use clap::Parser;
 use regex::Regex;
 use signal_hook::{consts::TERM_SIGNALS, flag, iterator::Signals};
 use std::{
+    collections::HashMap,
     error::Error,
     fmt::Display,
     io::{self, BufRead, BufReader, BufWriter, Cursor, Read, Write},
@@ -64,22 +65,34 @@ impl Error for ConnectionError {}
 struct Request<'t> {
     path: String,
     matches: Option<Vec<Option<String>>>,
+    headers: HashMap<String, String>,
     body: &'t mut dyn BufRead,
 }
 
-fn request_line_pat() -> &'static regex::Regex {
-    static RE: OnceLock<regex::Regex> = OnceLock::new();
-    RE.get_or_init(|| regex::Regex::new("^GET (/[^ ]*) HTTP/1.1\r\n$").unwrap())
-}
+fn parse_request<'t>(reader: &'t mut dyn BufRead) -> Result<Request<'t>, ConnectionError> {
+    let mut lines = reader.lines();
 
-fn parse_path(reader: &mut dyn BufRead) -> Result<String, ConnectionError> {
-    let mut request_line = String::new();
-    reader.read_line(&mut request_line)?;
-    let caps = request_line_pat()
-        .captures(&request_line)
-        .ok_or(RequestParsingError)?;
-    let path = caps.get(1).ok_or(RequestParsingError)?.as_str().to_owned();
-    Ok(path)
+    // path
+    static PATH: OnceLock<Regex> = OnceLock::new();
+    let pat = PATH.get_or_init(|| Regex::new("^GET (/[^ ]*) HTTP/1.1$").unwrap());
+    let line = lines.next().ok_or(RequestParsingError)??;
+    let path = pat.captures(&line).ok_or(RequestParsingError)?[1].to_owned();
+
+    // headers
+    static HEADER: OnceLock<Regex> = OnceLock::new();
+    let pat = HEADER.get_or_init(|| Regex::new("^([^ ]+): (.+)$").unwrap());
+    let mut headers = HashMap::new();
+    for line in lines {
+        let line = line?;
+        if line.is_empty() {
+            break;
+        }
+        let caps = pat.captures(&line).ok_or(RequestParsingError)?;
+        let (key, value) = (caps[1].to_owned(), caps[2].to_owned());
+        headers.insert(key, value);
+    }
+
+    Ok(Request { path, headers, body: reader, matches: None })
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -93,11 +106,13 @@ enum ServerState {
 enum HttpStatus {
     OK,
     NotFound,
+    BadRequest,
 }
 
 impl Display for HttpStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let message = match self {
+            HttpStatus::BadRequest => "400 Bad Request",
             HttpStatus::NotFound => "404 Not Found",
             HttpStatus::OK => "200 OK",
         };
@@ -114,6 +129,12 @@ impl Display for HttpError {
     }
 }
 
+impl From<HttpStatus> for HttpError {
+    fn from(value: HttpStatus) -> Self {
+        Self(value)
+    }
+}
+
 impl Error for HttpError {}
 
 type HttpResult = Result<Response, HttpError>;
@@ -124,15 +145,22 @@ struct Body {
     content_type: String,
 }
 
-impl Body {
-    fn plain_text(data: Box<dyn Read>, content_length: usize) -> Option<Self> {
-        Some(Self { data, content_type: String::from("text/plain"), content_length })
-    }
-}
-
 struct Response {
     status: HttpStatus,
     body: Option<Body>,
+}
+
+impl Response {
+    fn empty() -> Self {
+        Response { status: HttpStatus::OK, body: None }
+    }
+
+    fn plain_text(text: String) -> Self {
+        let content_length = text.len();
+        let content_type = String::from("text/plain");
+        let data = Box::new(Cursor::new(text.into_bytes()));
+        Response { status: HttpStatus::OK, body: Some(Body { content_length, content_type, data }) }
+    }
 }
 
 trait Handler: Send + Sync {
@@ -155,11 +183,7 @@ impl Handler for Router {
     fn handle(&self, mut req: Request) -> Result<Response, HttpError> {
         for (pat, handler) in &self.routes {
             if let Some(caps) = pat.captures(&req.path) {
-                req.matches = Some(
-                    caps.iter()
-                        .map(|x| x.map(|m| m.as_str().to_owned()))
-                        .collect(),
-                );
+                req.matches = Some(caps.iter().map(|x| x.map(|m| m.as_str().to_owned())).collect());
                 return handler.handle(req);
             }
         }
@@ -208,8 +232,7 @@ impl Server {
         stream.set_write_timeout(Some(Duration::from_millis(self.config.write_timeout_ms)))?;
         stream.set_read_timeout(Some(Duration::from_millis(self.config.read_timeout_ms)))?;
 
-        let path = parse_path(&mut reader)?;
-        let request = Request { path, body: &mut reader, matches: None };
+        let request = parse_request(&mut reader)?;
         let response = self.handler.handle(request);
         match response {
             Err(HttpError(status)) => {
@@ -273,14 +296,14 @@ fn main() {
     let server = Arc::new(Server::start(
         config,
         Router::default()
-            .route("^/$", |_req: Request<'_>| {
-                Ok(Response { body: None, status: HttpStatus::OK })
-            })
-            .route("^/echo/([^/]+)$", |req: Request<'_>| {
+            .route("^/$", |_req: Request| Ok(Response::empty()))
+            .route("^/echo/([^/]+)$", |req: Request| {
                 let message = req.matches.unwrap().swap_remove(1).unwrap();
-                let length = message.len();
-                let body = Box::new(Cursor::new(message.into_bytes()));
-                Ok(Response { status: HttpStatus::OK, body: Body::plain_text(body, length) })
+                Ok(Response::plain_text(message))
+            })
+            .route("^/user-agent$", |req: Request| {
+                let user_agent = req.headers.get("User-Agent").ok_or(HttpStatus::BadRequest)?;
+                Ok(Response::plain_text(user_agent.to_owned()))
             }),
     ));
 
