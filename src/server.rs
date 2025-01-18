@@ -1,4 +1,4 @@
-use crate::{Body, Handler, HttpError, Request, Response};
+use crate::{thread_pool::ThreadPool, Body, Handler, HttpError, Request, Response};
 use clap::Parser;
 use regex::Regex;
 use std::{
@@ -7,7 +7,7 @@ use std::{
     fmt::Display,
     io::{self, BufRead, BufReader, BufWriter, Write},
     net::{TcpListener, TcpStream},
-    sync::{Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
 
@@ -80,6 +80,8 @@ pub struct Config {
     pub write_timeout_ms: u64,
     #[arg(long, default_value = "1000")]
     pub read_timeout_ms: u64,
+    #[arg(long, default_value = "4")]
+    pub workers: usize,
 }
 
 impl Default for Config {
@@ -89,59 +91,28 @@ impl Default for Config {
             port: 0,
             write_timeout_ms: 1000,
             read_timeout_ms: 1000,
+            workers: 4,
         }
     }
 }
 
-pub struct Server {
-    config: Config,
-    addr: String,
-    listener: TcpListener,
-    state: Mutex<ServerState>,
-    handler: Box<dyn Handler>,
+struct ConnectionHandler {
+    request_handler: Box<dyn Handler>,
 }
 
-impl Drop for Server {
-    fn drop(&mut self) {
-        self.stop();
-    }
-}
-
-impl Server {
-    pub fn start<H: Into<Box<dyn Handler>>>(config: Config, handler: H) -> Self {
-        let addr = format!("{}:{}", config.host, config.port);
-        let listener = TcpListener::bind(&addr).unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
-        let state = Mutex::new(ServerState::Stopped);
-        let handler = handler.into();
-        Self { config, listener, addr, state, handler }
+impl ConnectionHandler {
+    fn new(request_handler: Box<dyn Handler>) -> Self {
+        Self { request_handler }
     }
 
-    pub fn stop(&self) {
-        let mut guard = self.state.lock().unwrap();
-        if *guard != ServerState::Running {
-            return;
-        }
-        *guard = ServerState::Stopping;
-        let _ = TcpStream::connect(&self.addr);
-    }
-
-    pub fn addr(&self) -> &str {
-        &self.addr
-    }
-
-    fn handle(&self, stream: io::Result<TcpStream>) -> Result<(), ConnectionError> {
-        let stream = stream?;
+    fn handle(&self, stream: TcpStream) -> Result<(), ConnectionError> {
         let addr = stream.peer_addr().unwrap().to_string();
-        stream.set_write_timeout(Some(Duration::from_millis(self.config.write_timeout_ms)))?;
-        stream.set_read_timeout(Some(Duration::from_millis(self.config.read_timeout_ms)))?;
-
         let mut reader = BufReader::new(&stream);
         let mut writer = BufWriter::new(&stream);
 
         let request = parse_request(&mut reader)?;
         let path = request.path.clone();
-        let response = self.handler.handle(request);
+        let response = self.request_handler.handle(request);
         let status = match response {
             Err(HttpError(status)) => {
                 write!(writer, "HTTP/1.1 {}\r\n", status)?;
@@ -165,6 +136,44 @@ impl Server {
         println!("{}: GET {}: {}", addr, path, status);
         Ok(())
     }
+}
+
+pub struct Server {
+    config: Config,
+    addr: String,
+    listener: TcpListener,
+    state: Mutex<ServerState>,
+    handler: Arc<ConnectionHandler>,
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+impl Server {
+    pub fn start<H: Into<Box<dyn Handler>>>(config: Config, handler: H) -> Self {
+        let addr = format!("{}:{}", config.host, config.port);
+        let listener = TcpListener::bind(&addr).unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let state = Mutex::new(ServerState::Stopped);
+        let handler = Arc::new(ConnectionHandler::new(handler.into()));
+        Self { config, listener, addr, state, handler }
+    }
+
+    pub fn stop(&self) {
+        let mut guard = self.state.lock().unwrap();
+        if *guard != ServerState::Running {
+            return;
+        }
+        *guard = ServerState::Stopping;
+        let _ = TcpStream::connect(&self.addr);
+    }
+
+    pub fn addr(&self) -> &str {
+        &self.addr
+    }
 
     pub fn listen_forever(&self) -> io::Result<()> {
         // don't start if we're already running
@@ -177,13 +186,20 @@ impl Server {
         }
 
         // run until stopped
+        let mut pool = ThreadPool::new(self.config.workers);
         for stream in self.listener.incoming() {
             if *self.state.lock().unwrap() == ServerState::Stopping {
                 break;
             }
-            if let Err(err) = self.handle(stream) {
-                eprintln!("failed to handle connection: {}", err);
-            }
+            let stream = stream?;
+            stream.set_write_timeout(Some(Duration::from_millis(self.config.write_timeout_ms)))?;
+            stream.set_read_timeout(Some(Duration::from_millis(self.config.read_timeout_ms)))?;
+            let handler = Arc::clone(&self.handler);
+            pool.execute(Box::new(move || {
+                if let Err(err) = handler.handle(stream) {
+                    eprintln!("failed to handle connection: {}", err);
+                }
+            }));
         }
 
         // mark as stopped
