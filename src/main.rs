@@ -2,20 +2,29 @@ use clap::Parser;
 use codecrafters_http_server::*;
 use signal_hook::{consts::TERM_SIGNALS, flag, iterator::Signals};
 use std::{
+    fs::File,
+    os::unix::fs::MetadataExt,
     sync::{atomic::AtomicBool, Arc},
     thread,
 };
 
 fn codecrafters_handler() -> Box<dyn Handler> {
     Router::default()
-        .route("^/$", |_req: Request| Ok(Response::empty()))
-        .route("^/echo/([^/]+)$", |req: Request| {
+        .route("^/$", |_ctx: &Context, _req: Request| Ok(Response::empty()))
+        .route("^/echo/([^/]+)$", |_ctx: &Context, req: Request| {
             let message = req.matches.unwrap().swap_remove(1).unwrap();
             Ok(Response::plain_text(message))
         })
-        .route("^/user-agent$", |req: Request| {
+        .route("^/user-agent$", |_ctx: &Context, req: Request| {
             let user_agent = req.get_header("User-Agent").ok_or(HttpStatus::BadRequest)?;
             Ok(Response::plain_text(user_agent.to_owned()))
+        })
+        .route("^/files/([^/]+)$", |ctx: &Context, req: Request| {
+            let filename = req.matches.unwrap().swap_remove(1).unwrap();
+            let path = ctx.working_dir.join(filename);
+            let file = File::open(path).map_err(|_| HttpStatus::NotFound)?;
+            let size = file.metadata().map_err(|_| HttpStatus::NotFound)?.size();
+            Ok(Response::binary(Box::new(file), size))
         })
         .into()
 }

@@ -1,11 +1,13 @@
-use crate::{thread_pool::ThreadPool, Body, Handler, HttpError, Request, Response};
+use crate::{thread_pool::ThreadPool, Body, Context, Handler, HttpError, Request, Response};
 use clap::Parser;
 use regex::Regex;
 use std::{
+    env,
     error::Error,
     fmt::Display,
     io::{self, BufRead, BufReader, BufWriter, Write},
     net::{TcpListener, TcpStream},
+    path::PathBuf,
     sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
@@ -81,6 +83,8 @@ pub struct Config {
     pub read_timeout_ms: u64,
     #[arg(long, default_value = "4")]
     pub workers: usize,
+    #[arg(long, default_value = ".")]
+    pub directory: PathBuf,
 }
 
 impl Default for Config {
@@ -91,17 +95,19 @@ impl Default for Config {
             write_timeout_ms: 1000,
             read_timeout_ms: 1000,
             workers: 4,
+            directory: env::current_dir().unwrap(),
         }
     }
 }
 
 struct ConnectionHandler {
+    context: Context,
     request_handler: Box<dyn Handler>,
 }
 
 impl ConnectionHandler {
-    fn new(request_handler: Box<dyn Handler>) -> Self {
-        Self { request_handler }
+    fn new(context: Context, request_handler: Box<dyn Handler>) -> Self {
+        Self { context, request_handler }
     }
 
     fn handle(&self, stream: TcpStream) -> Result<(), ConnectionError> {
@@ -111,7 +117,7 @@ impl ConnectionHandler {
 
         let request = parse_request(&mut reader)?;
         let path = request.path.clone();
-        let response = self.request_handler.handle(request);
+        let response = self.request_handler.handle(&self.context, request);
         let status = match response {
             Err(HttpError(status)) => {
                 write!(writer, "HTTP/1.1 {}\r\n", status)?;
@@ -157,7 +163,8 @@ impl Server {
         let listener = TcpListener::bind(&addr).unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let state = Mutex::new(ServerState::Stopped);
-        let handler = Arc::new(ConnectionHandler::new(handler.into()));
+        let context = Context { working_dir: config.directory.clone() };
+        let handler = Arc::new(ConnectionHandler::new(context, handler.into()));
         Self { config, listener, addr, state, handler }
     }
 
@@ -223,7 +230,7 @@ mod test {
     fn test_lifecycle() {
         for _ in 0..10 {
             let config = Config::default();
-            let server = Arc::new(Server::start(config, |_req: Request<'_>| {
+            let server = Arc::new(Server::start(config, |_ctx: &Context, _req: Request<'_>| {
                 Ok(Response { body: None, status: HttpStatus::OK })
             }));
             let addr = format!("http://{}", server.addr());

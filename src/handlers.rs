@@ -1,9 +1,15 @@
+use std::path::PathBuf;
+
 use regex::Regex;
 
 use crate::{HttpError, HttpStatus, Request, Response};
 
+pub struct Context {
+    pub working_dir: PathBuf,
+}
+
 pub trait Handler: Send + Sync {
-    fn handle(&self, req: Request) -> Result<Response, HttpError>;
+    fn handle(&self, ctx: &Context, req: Request) -> Result<Response, HttpError>;
 }
 
 impl<H: Handler + 'static> From<H> for Box<dyn Handler> {
@@ -12,9 +18,12 @@ impl<H: Handler + 'static> From<H> for Box<dyn Handler> {
     }
 }
 
-impl<F: Fn(Request) -> Result<Response, HttpError> + Send + Sync + 'static> Handler for F {
-    fn handle(&self, req: Request) -> Result<Response, HttpError> {
-        self(req)
+impl<F> Handler for F
+where
+    F: Fn(&Context, Request) -> Result<Response, HttpError> + Send + Sync + 'static,
+{
+    fn handle(&self, ctx: &Context, req: Request) -> Result<Response, HttpError> {
+        self(ctx, req)
     }
 }
 
@@ -31,11 +40,11 @@ impl Router {
 }
 
 impl Handler for Router {
-    fn handle(&self, mut req: Request) -> Result<Response, HttpError> {
+    fn handle(&self, ctx: &Context, mut req: Request) -> Result<Response, HttpError> {
         for (pat, handler) in &self.routes {
             if let Some(caps) = pat.captures(&req.path) {
                 req.matches = Some(caps.iter().map(|x| x.map(|m| m.as_str().to_owned())).collect());
-                return handler.handle(req);
+                return handler.handle(ctx, req);
             }
         }
         Err(HttpError(HttpStatus::NotFound))

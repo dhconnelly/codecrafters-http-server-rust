@@ -57,7 +57,7 @@ impl Error for HttpError {}
 
 pub struct Body {
     pub data: Box<dyn Read>,
-    pub content_length: usize,
+    pub content_length: u64,
     pub content_type: String,
 }
 
@@ -71,9 +71,15 @@ impl Response {
         Response { status: HttpStatus::OK, body: None }
     }
 
+    pub fn binary(data: Box<dyn Read>, size: u64) -> Self {
+        let content_length = size;
+        let content_type = "application/octet-stream".to_string();
+        Response { status: HttpStatus::OK, body: Some(Body { content_length, content_type, data }) }
+    }
+
     pub fn plain_text(text: String) -> Self {
-        let content_length = text.len();
-        let content_type = String::from("text/plain");
+        let content_length = text.len() as u64;
+        let content_type = "text/plain".to_string();
         let data = Box::new(Cursor::new(text.into_bytes()));
         Response { status: HttpStatus::OK, body: Some(Body { content_length, content_type, data }) }
     }
