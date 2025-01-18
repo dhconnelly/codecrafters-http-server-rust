@@ -6,7 +6,6 @@ use std::{
 type Task = Box<dyn FnOnce() + Send + 'static>;
 
 struct Worker {
-    id: usize,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -26,7 +25,7 @@ impl Worker {
             }
             println!("worker {} stopping", id);
         });
-        Worker { id, handle: Some(handle) }
+        Worker { handle: Some(handle) }
     }
 }
 

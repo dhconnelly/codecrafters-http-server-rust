@@ -2,7 +2,6 @@ use crate::{thread_pool::ThreadPool, Body, Handler, HttpError, Request, Response
 use clap::Parser;
 use regex::Regex;
 use std::{
-    collections::HashMap,
     error::Error,
     fmt::Display,
     io::{self, BufRead, BufReader, BufWriter, Write},
@@ -33,7 +32,7 @@ struct RequestParsingError;
 
 impl From<RequestParsingError> for ConnectionError {
     fn from(_err: RequestParsingError) -> Self {
-        Self(format!("failed to parse request"))
+        Self("failed to parse request".to_string())
     }
 }
 
@@ -50,13 +49,13 @@ fn parse_header(line: String) -> Result<(String, String), ConnectionError> {
     Ok((caps[1].to_owned(), caps[2].to_owned()))
 }
 
-fn parse_request<'t>(reader: &'t mut dyn BufRead) -> Result<Request<'t>, ConnectionError> {
+fn parse_request(reader: &mut dyn BufRead) -> Result<Request<'_>, ConnectionError> {
     let mut lines = reader.lines();
 
     let path = parse_path(lines.next().ok_or(RequestParsingError)??)?;
     let headers = lines
         .take_while(|line| line.as_ref().map(|s| !s.is_empty()).unwrap_or(false))
-        .map(|line| line.map_err(|err| err.into()).and_then(|s| parse_header(s)))
+        .map(|line| line.map_err(|err| err.into()).and_then(parse_header))
         .collect::<Result<Vec<(String, String)>, _>>()?;
 
     Ok(Request { path, headers, body: reader, matches: None })

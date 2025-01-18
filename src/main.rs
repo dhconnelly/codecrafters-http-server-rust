@@ -1,16 +1,9 @@
 use clap::Parser;
 use codecrafters_http_server::*;
-use regex::Regex;
 use signal_hook::{consts::TERM_SIGNALS, flag, iterator::Signals};
 use std::{
-    collections::HashMap,
-    error::Error,
-    fmt::Display,
-    io::{self, BufRead, BufReader, BufWriter, Cursor, Read, Write},
-    net::{TcpListener, TcpStream},
-    sync::{atomic::AtomicBool, Arc, Mutex, OnceLock},
+    sync::{atomic::AtomicBool, Arc},
     thread,
-    time::Duration,
 };
 
 fn codecrafters_handler() -> Box<dyn Handler> {
