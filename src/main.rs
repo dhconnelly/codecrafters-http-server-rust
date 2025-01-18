@@ -1,24 +1,26 @@
 use clap::Parser;
 use regex::Regex;
+use signal_hook::{consts::TERM_SIGNALS, flag, iterator::Signals};
 use std::{
     error::Error,
     fmt::Display,
     io::{self, BufRead, BufReader, BufWriter, Cursor, Read, Write},
     net::{TcpListener, TcpStream},
-    sync::{Mutex, OnceLock},
+    sync::{atomic::AtomicBool, Arc, Mutex, OnceLock},
+    thread,
     time::Duration,
 };
 
 #[derive(Parser)]
 #[command(version, about)]
 struct Config {
-    #[arg(default_value = "127.0.0.1")]
+    #[arg(long, default_value = "127.0.0.1")]
     host: String,
-    #[arg(default_value = "4221")]
+    #[arg(long, default_value = "4221")]
     port: u16,
-    #[arg(default_value = "1000")]
+    #[arg(long, default_value = "1000")]
     write_timeout_ms: u64,
-    #[arg(default_value = "1000")]
+    #[arg(long, default_value = "1000")]
     read_timeout_ms: u64,
 }
 
@@ -194,6 +196,10 @@ impl Server {
         let _ = TcpStream::connect(&self.addr);
     }
 
+    fn addr(&self) -> &str {
+        &self.addr
+    }
+
     fn handle(&self, stream: io::Result<TcpStream>) -> Result<(), ConnectionError> {
         let stream = stream?;
         let mut reader = BufReader::new(&stream);
@@ -264,7 +270,7 @@ impl<H: Handler + 'static> From<H> for Box<dyn Handler> {
 
 fn main() {
     let config = Config::parse();
-    let server = Server::start(
+    let server = Arc::new(Server::start(
         config,
         Router::default()
             .route("^/$", |_req: Request<'_>| {
@@ -276,9 +282,32 @@ fn main() {
                 let body = Box::new(Cursor::new(message.into_bytes()));
                 Ok(Response { status: HttpStatus::OK, body: Body::plain_text(body, length) })
             }),
-    );
-    println!("listening at http://{}", server.addr);
-    server.listen().expect("failure");
+    ));
+
+    // handle double-terminate
+    let term_now = Arc::new(AtomicBool::new(false));
+    for sig in TERM_SIGNALS {
+        flag::register_conditional_shutdown(*sig, 1, Arc::clone(&term_now)).unwrap();
+        flag::register(*sig, Arc::clone(&term_now)).unwrap();
+    }
+
+    let mut sigs = Signals::new(TERM_SIGNALS).unwrap();
+
+    let server2 = Arc::clone(&server);
+    let handle = thread::spawn(move || {
+        println!("listening at http://{}", server2.addr());
+        server2.listen().expect("failed to start server");
+    });
+
+    for _ in &mut sigs {
+        break;
+    }
+
+    println!("stopping...");
+    server.stop();
+
+    handle.join().unwrap();
+    println!("server stopped, exiting");
 }
 
 #[cfg(test)]
@@ -294,19 +323,16 @@ mod test {
             let server = Arc::new(Server::start(config, |_req: Request<'_>| {
                 Ok(Response { body: None, status: HttpStatus::OK })
             }));
-            let addr = server.addr.clone();
+            let addr = format!("http://{}", server.addr);
 
             for _ in 0..10 {
                 let server2 = Arc::clone(&server);
                 let handle = thread::spawn(move || server2.listen());
 
                 for _ in 0..10 {
-                    // try connecting
-                    let conn = TcpStream::connect(&addr);
-                    assert!(conn.is_ok());
-                    // let resp = reqwest::blocking::get(&addr).unwrap();
-                    // assert!(resp.status().is_success());
-                    // assert_eq!(resp.text().unwrap(), "");
+                    let resp = reqwest::blocking::get(&addr).unwrap();
+                    assert!(resp.status().is_success());
+                    assert_eq!(resp.text().unwrap(), "");
                 }
 
                 server.stop();
