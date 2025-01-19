@@ -56,7 +56,7 @@ pub struct Request<'t> {
     pub method: Method,
     pub path: String,
     pub matches: Option<Vec<Option<String>>>,
-    pub headers: Vec<(String, String)>,
+    headers: Vec<(String, String)>,
     pub body: &'t mut dyn BufRead,
 }
 
@@ -139,36 +139,50 @@ impl From<HttpStatus> for HttpError {
 
 impl Error for HttpError {}
 
-pub struct Body {
-    pub data: Box<dyn Read>,
-    pub content_length: u64,
-    pub content_type: String,
-}
-
 pub struct Response {
     pub status: HttpStatus,
-    pub body: Option<Body>,
+    headers: Vec<(String, String)>,
+    // TODO: can we eliminate the box?
+    pub body: Option<Box<dyn Read>>,
 }
 
 impl Response {
+    pub fn headers(&self) -> impl Iterator<Item = &(String, String)> {
+        self.headers.iter()
+    }
+
+    pub fn set_header(&mut self, new_k: String, new_v: String) {
+        if let Some((_, v)) =
+            self.headers.iter_mut().find(|(k, _)| k.to_lowercase() == new_k.to_lowercase())
+        {
+            *v = new_v;
+        } else {
+            self.headers.push((new_k, new_v));
+        }
+    }
+
     pub fn empty() -> Self {
-        Response { status: HttpStatus::OK, body: None }
+        Response { status: HttpStatus::OK, body: None, headers: Vec::new() }
     }
 
     pub fn binary(data: Box<dyn Read>, size: u64) -> Self {
-        let content_length = size;
-        let content_type = "application/octet-stream".to_string();
-        Response { status: HttpStatus::OK, body: Some(Body { content_length, content_type, data }) }
+        let headers = vec![
+            ("content-length".to_string(), size.to_string()),
+            ("content-type".to_string(), "application/octet-stream".to_string()),
+        ];
+        Response { status: HttpStatus::OK, body: Some(data), headers }
     }
 
     pub fn created() -> Self {
-        Response { status: HttpStatus::Created, body: None }
+        Response { status: HttpStatus::Created, body: None, headers: Vec::new() }
     }
 
     pub fn plain_text(text: String) -> Self {
-        let content_length = text.len() as u64;
-        let content_type = "text/plain".to_string();
+        let headers = vec![
+            ("content-length".to_string(), text.len().to_string()),
+            ("content-type".to_string(), "text/plain".to_string()),
+        ];
         let data = Box::new(Cursor::new(text.into_bytes()));
-        Response { status: HttpStatus::OK, body: Some(Body { content_length, content_type, data }) }
+        Response { status: HttpStatus::OK, body: Some(data), headers }
     }
 }

@@ -1,6 +1,6 @@
 use crate::{
-    decompress, parse_request, thread_pool::ThreadPool, Body, Context, Handler, HttpError, Request,
-    RequestParsingError, Response,
+    parse_request, thread_pool::ThreadPool, CompressionFactory, Context, Handler, HttpError,
+    Request, RequestParsingError, Response,
 };
 use clap::Parser;
 use std::{
@@ -29,24 +29,13 @@ impl<E: Error> From<E> for MiddlewareError {
     }
 }
 
+pub trait MiddlewareFactory: Send + Sync {
+    fn new(&self, req: &Request) -> Option<Box<dyn Middleware>>;
+}
+
 pub trait Middleware: Send + Sync {
-    fn apply(&self, req: &mut Request) -> Result<(), MiddlewareError>;
-}
-
-impl<E, F> Middleware for F
-where
-    E: Error + 'static,
-    F: Fn(&mut Request) -> Result<(), E> + Send + Sync + 'static,
-{
-    fn apply(&self, req: &mut Request) -> Result<(), MiddlewareError> {
-        self(req).map_err(|err| err.into())
-    }
-}
-
-impl<M: Middleware + 'static> From<M> for Box<dyn Middleware> {
-    fn from(value: M) -> Self {
-        Box::new(value)
-    }
+    fn apply_before(&self, req: &mut Request) -> Result<(), MiddlewareError>;
+    fn apply_after(&self, resp: &mut Response) -> Result<(), MiddlewareError>;
 }
 
 #[derive(Debug)]
@@ -118,14 +107,14 @@ impl Default for Config {
 struct ConnectionHandler {
     context: Context,
     request_handler: Box<dyn Handler>,
-    middleware: Vec<Box<dyn Middleware>>,
+    middleware: Vec<Box<dyn MiddlewareFactory>>,
 }
 
 impl ConnectionHandler {
     fn new(
         context: Context,
         request_handler: Box<dyn Handler>,
-        middleware: Vec<Box<dyn Middleware>>,
+        middleware: Vec<Box<dyn MiddlewareFactory>>,
     ) -> Self {
         Self { context, request_handler, middleware }
     }
@@ -136,29 +125,33 @@ impl ConnectionHandler {
         let mut writer = BufWriter::new(&stream);
 
         let mut request = parse_request(&mut reader)?;
-        for f in &self.middleware {
-            f.apply(&mut request)?;
+        let middleware: Vec<Box<dyn Middleware>> =
+            self.middleware.iter().flat_map(|m| m.new(&request)).collect();
+        for m in &middleware {
+            m.apply_before(&mut request)?;
         }
 
         let (method, path) = (request.method, request.path.clone());
-        let response = self.request_handler.handle(&self.context, request);
-        let status = match response {
+        let result = self.request_handler.handle(&self.context, request);
+        let status = match result {
             Err(HttpError(status)) => {
                 write!(writer, "HTTP/1.1 {}\r\n", status)?;
                 write!(writer, "\r\n")?;
                 status
             }
-            Ok(Response { status, mut body }) => {
-                write!(writer, "HTTP/1.1 {}\r\n", status)?;
-                if let Some(Body { content_length, content_type, .. }) = &body {
-                    write!(writer, "Content-Type: {}\r\n", content_type)?;
-                    write!(writer, "Content-Length: {}\r\n", content_length)?;
+            Ok(mut resp) => {
+                for m in &middleware {
+                    m.apply_after(&mut resp)?;
+                }
+                write!(writer, "HTTP/1.1 {}\r\n", resp.status)?;
+                for (k, v) in resp.headers() {
+                    write!(writer, "{}: {}\r\n", k, v)?;
                 }
                 write!(writer, "\r\n")?;
-                if let Some(Body { ref mut data, .. }) = &mut body {
+                if let Some(data) = &mut resp.body {
                     io::copy(data, &mut writer)?;
                 }
-                status
+                resp.status
             }
         };
 
@@ -181,8 +174,8 @@ impl Drop for Server {
     }
 }
 
-fn default_middleware() -> Vec<Box<dyn Middleware>> {
-    vec![decompress.into()]
+fn default_middleware() -> Vec<Box<dyn MiddlewareFactory>> {
+    vec![Box::new(CompressionFactory)]
 }
 
 impl Server {
@@ -251,7 +244,7 @@ impl Server {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::{HttpStatus, Request};
+    use crate::Request;
     use std::{sync::Arc, thread};
 
     // TODO: test out of order lifecycle calls
@@ -261,7 +254,7 @@ mod test {
         for _ in 0..10 {
             let config = Config::default();
             let server = Arc::new(Server::start(config, |_ctx: &Context, _req: Request<'_>| {
-                Ok(Response { body: None, status: HttpStatus::OK })
+                Ok(Response::empty())
             }));
             let addr = format!("http://{}", server.addr());
 

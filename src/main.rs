@@ -166,4 +166,16 @@ mod test {
         let resp = client.post(format!("http://{}/test-post", server.addr())).send().unwrap();
         assert!(resp.status().is_success());
     }
+
+    #[test]
+    fn test_compression() {
+        let server = make_server(Config::default());
+        let server2 = Arc::clone(&server);
+        thread::spawn(move || server2.listen_forever().unwrap());
+
+        let client = reqwest::blocking::Client::builder().gzip(true).build().unwrap();
+        let resp = client.get(format!("http://{}/echo/foo", server.addr())).send().unwrap();
+        assert!(resp.status().is_success());
+        assert_eq!(resp.text().unwrap(), "foo");
+    }
 }
