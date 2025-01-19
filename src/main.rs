@@ -78,6 +78,10 @@ fn codecrafters_handler() -> Box<dyn Handler> {
         .into()
 }
 
+fn make_server(config: Config) -> Arc<Server> {
+    Arc::new(Server::start(config, codecrafters_handler()))
+}
+
 fn main() {
     // listen for SIGTERM, immediately quit if received twice
     let term_now = Arc::new(AtomicBool::new(false));
@@ -88,9 +92,7 @@ fn main() {
     let mut sigs = Signals::new(TERM_SIGNALS).unwrap();
 
     // run the server in a background thread
-    let config = Config::parse();
-    let handler = codecrafters_handler();
-    let server = Arc::new(Server::start(config, handler));
+    let server = make_server(Config::parse());
     let server2 = Arc::clone(&server);
     let handle = thread::spawn(move || {
         server2.listen_forever().expect("failed to start server");
@@ -109,15 +111,9 @@ fn main() {
 mod test {
     use super::*;
 
-    fn make_server() -> Arc<Server> {
-        let config = Config::default();
-        let handler = codecrafters_handler();
-        Arc::new(Server::start(config, handler))
-    }
-
     #[test]
     fn test_root() {
-        let server = make_server();
+        let server = make_server(Config::default());
         let server2 = Arc::clone(&server);
         thread::spawn(move || server2.listen_forever().unwrap());
 
@@ -127,7 +123,7 @@ mod test {
 
     #[test]
     fn test_not_found() {
-        let server = make_server();
+        let server = make_server(Config::default());
         let server2 = Arc::clone(&server);
         thread::spawn(move || server2.listen_forever().unwrap());
 
@@ -137,7 +133,7 @@ mod test {
 
     #[test]
     fn test_echo() {
-        let server = make_server();
+        let server = make_server(Config::default());
         let server2 = Arc::clone(&server);
         thread::spawn(move || server2.listen_forever().unwrap());
 
@@ -148,7 +144,7 @@ mod test {
 
     #[test]
     fn test_user_agent() {
-        let server = make_server();
+        let server = make_server(Config::default());
         let server2 = Arc::clone(&server);
         thread::spawn(move || server2.listen_forever().unwrap());
 
@@ -162,7 +158,7 @@ mod test {
     // TODO: move this test to handlers.rs
     #[test]
     fn test_post() {
-        let server = make_server();
+        let server = make_server(Config::default());
         let server2 = Arc::clone(&server);
         thread::spawn(move || server2.listen_forever().unwrap());
 

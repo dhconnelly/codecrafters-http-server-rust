@@ -1,6 +1,6 @@
 use crate::{
-    parse_request, thread_pool::ThreadPool, Body, Context, Handler, HttpError, RequestParsingError,
-    Response,
+    decompress, parse_request, thread_pool::ThreadPool, Body, Context, Handler, HttpError, Request,
+    RequestParsingError, Response,
 };
 use clap::Parser;
 use std::{
@@ -13,6 +13,41 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
+
+#[derive(Debug)]
+pub struct MiddlewareError(String);
+
+impl Display for MiddlewareError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "failed to apply middleware: {}", self.0)
+    }
+}
+
+impl<E: Error> From<E> for MiddlewareError {
+    fn from(value: E) -> Self {
+        Self(value.to_string())
+    }
+}
+
+pub trait Middleware: Send + Sync {
+    fn apply(&self, req: &mut Request) -> Result<(), MiddlewareError>;
+}
+
+impl<E, F> Middleware for F
+where
+    E: Error + 'static,
+    F: Fn(&mut Request) -> Result<(), E> + Send + Sync + 'static,
+{
+    fn apply(&self, req: &mut Request) -> Result<(), MiddlewareError> {
+        self(req).map_err(|err| err.into())
+    }
+}
+
+impl<M: Middleware + 'static> From<M> for Box<dyn Middleware> {
+    fn from(value: M) -> Self {
+        Box::new(value)
+    }
+}
 
 #[derive(Debug)]
 struct ConnectionError(String);
@@ -32,8 +67,14 @@ impl From<io::Error> for ConnectionError {
 }
 
 impl From<RequestParsingError> for ConnectionError {
-    fn from(_err: RequestParsingError) -> Self {
-        Self("failed to parse request".to_string())
+    fn from(err: RequestParsingError) -> Self {
+        Self(err.to_string())
+    }
+}
+
+impl From<MiddlewareError> for ConnectionError {
+    fn from(err: MiddlewareError) -> Self {
+        Self(err.to_string())
     }
 }
 
@@ -77,11 +118,16 @@ impl Default for Config {
 struct ConnectionHandler {
     context: Context,
     request_handler: Box<dyn Handler>,
+    middleware: Vec<Box<dyn Middleware>>,
 }
 
 impl ConnectionHandler {
-    fn new(context: Context, request_handler: Box<dyn Handler>) -> Self {
-        Self { context, request_handler }
+    fn new(
+        context: Context,
+        request_handler: Box<dyn Handler>,
+        middleware: Vec<Box<dyn Middleware>>,
+    ) -> Self {
+        Self { context, request_handler, middleware }
     }
 
     fn handle(&self, stream: TcpStream) -> Result<(), ConnectionError> {
@@ -89,8 +135,12 @@ impl ConnectionHandler {
         let mut reader = BufReader::new(&stream);
         let mut writer = BufWriter::new(&stream);
 
-        let request = parse_request(&mut reader)?;
-        let path = request.path.clone();
+        let mut request = parse_request(&mut reader)?;
+        for f in &self.middleware {
+            f.apply(&mut request)?;
+        }
+
+        let (method, path) = (request.method, request.path.clone());
         let response = self.request_handler.handle(&self.context, request);
         let status = match response {
             Err(HttpError(status)) => {
@@ -112,7 +162,7 @@ impl ConnectionHandler {
             }
         };
 
-        println!("{}: GET {}: {}", addr, path, status);
+        println!("{}: {} {}: {}", addr, method, path, status);
         Ok(())
     }
 }
@@ -131,14 +181,20 @@ impl Drop for Server {
     }
 }
 
+fn default_middleware() -> Vec<Box<dyn Middleware>> {
+    vec![decompress.into()]
+}
+
 impl Server {
     pub fn start<H: Into<Box<dyn Handler>>>(config: Config, handler: H) -> Self {
         let addr = format!("{}:{}", config.host, config.port);
         let listener = TcpListener::bind(&addr).unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let state = Mutex::new(ServerState::Stopped);
-        let context = Context { working_dir: config.directory.clone() };
-        let handler = Arc::new(ConnectionHandler::new(context, handler.into()));
+        let working_dir = config.directory.clone();
+        let context = Context { working_dir };
+        let handler =
+            Arc::new(ConnectionHandler::new(context, handler.into(), default_middleware()));
         Self { config, listener, addr, state, handler }
     }
 

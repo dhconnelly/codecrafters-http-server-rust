@@ -17,10 +17,28 @@ impl From<io::Error> for RequestParsingError {
     }
 }
 
+impl Display for RequestParsingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "failed to parse request")
+    }
+}
+
+impl Error for RequestParsingError {}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Method {
     Get,
     Post,
+}
+
+impl Display for Method {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::Get => "GET",
+            Self::Post => "POST",
+        };
+        write!(f, "{}", s)
+    }
 }
 
 impl FromStr for Method {
