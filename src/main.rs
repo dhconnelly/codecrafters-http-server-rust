@@ -9,6 +9,7 @@ use std::{
     thread,
 };
 
+// TODO: use Read and move to a different module
 struct SizedReader<'t> {
     r: &'t mut dyn BufRead,
     lim: usize,
