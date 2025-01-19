@@ -1,10 +1,41 @@
 use std::{
     error::Error,
     fmt::Display,
-    io::{BufRead, Cursor, Read},
+    io::{self, BufRead, Cursor, Read},
+    str::FromStr,
+    sync::OnceLock,
 };
 
+use regex::Regex;
+
+#[derive(Debug)]
+pub struct RequestParsingError;
+
+impl From<io::Error> for RequestParsingError {
+    fn from(_value: io::Error) -> Self {
+        Self
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Method {
+    Get,
+    Post,
+}
+
+impl FromStr for Method {
+    type Err = RequestParsingError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "POST" => Ok(Self::Post),
+            "GET" => Ok(Self::Get),
+            _ => Err(RequestParsingError),
+        }
+    }
+}
+
 pub struct Request<'t> {
+    pub method: Method,
     pub path: String,
     pub matches: Option<Vec<Option<String>>>,
     pub headers: Vec<(String, String)>,
@@ -12,6 +43,11 @@ pub struct Request<'t> {
 }
 
 impl Request<'_> {
+    pub fn with_matches(mut self, matches: Vec<Option<String>>) -> Self {
+        self.matches = Some(matches);
+        self
+    }
+
     pub fn get_header(&self, key: &str) -> Option<&str> {
         self.headers
             .iter()
@@ -20,11 +56,39 @@ impl Request<'_> {
     }
 }
 
+fn parse_request_line(line: String) -> Result<(Method, String), RequestParsingError> {
+    static PATH: OnceLock<Regex> = OnceLock::new();
+    let pat = PATH.get_or_init(|| Regex::new("^(GET|POST) (/[^ ]*) HTTP/1.1$").unwrap());
+    let caps = pat.captures(&line).ok_or(RequestParsingError)?;
+    let method = caps[1].parse()?;
+    let path = caps[2].to_string();
+    Ok((method, path))
+}
+
+fn parse_header(line: String) -> Result<(String, String), RequestParsingError> {
+    static HEADER: OnceLock<Regex> = OnceLock::new();
+    let pat = HEADER.get_or_init(|| Regex::new("^([^ ]+): (.+)$").unwrap());
+    let caps = pat.captures(&line).ok_or(RequestParsingError)?;
+    Ok((caps[1].to_owned(), caps[2].to_owned()))
+}
+
+pub fn parse_request(reader: &mut dyn BufRead) -> Result<Request<'_>, RequestParsingError> {
+    let mut lines = reader.lines();
+    let (method, path) = parse_request_line(lines.next().ok_or(RequestParsingError)??)?;
+    let headers = lines
+        .take_while(|line| line.as_ref().map(|s| !s.is_empty()).unwrap_or(false))
+        .map(|line| line.map_err(|err| err.into()).and_then(parse_header))
+        .collect::<Result<Vec<(String, String)>, _>>()?;
+    Ok(Request { method, path, headers, body: reader, matches: None })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HttpStatus {
     OK,
+    Created,
     NotFound,
     BadRequest,
+    ServerError,
 }
 
 impl Display for HttpStatus {
@@ -33,6 +97,8 @@ impl Display for HttpStatus {
             HttpStatus::BadRequest => "400 Bad Request",
             HttpStatus::NotFound => "404 Not Found",
             HttpStatus::OK => "200 OK",
+            HttpStatus::Created => "201 Created",
+            HttpStatus::ServerError => "500 Internal Server Error",
         };
         write!(f, "{}", message)
     }
@@ -75,6 +141,10 @@ impl Response {
         let content_length = size;
         let content_type = "application/octet-stream".to_string();
         Response { status: HttpStatus::OK, body: Some(Body { content_length, content_type, data }) }
+    }
+
+    pub fn created() -> Self {
+        Response { status: HttpStatus::Created, body: None }
     }
 
     pub fn plain_text(text: String) -> Self {

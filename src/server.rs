@@ -1,4 +1,7 @@
-use crate::{thread_pool::ThreadPool, Body, Context, Handler, HttpError, Request, Response};
+use crate::{
+    parse_request, thread_pool::ThreadPool, Body, Context, Handler, HttpError, Request,
+    RequestParsingError, Response,
+};
 use clap::Parser;
 use regex::Regex;
 use std::{
@@ -29,38 +32,10 @@ impl From<io::Error> for ConnectionError {
     }
 }
 
-#[derive(Debug)]
-struct RequestParsingError;
-
 impl From<RequestParsingError> for ConnectionError {
     fn from(_err: RequestParsingError) -> Self {
         Self("failed to parse request".to_string())
     }
-}
-
-fn parse_path(line: String) -> Result<String, ConnectionError> {
-    static PATH: OnceLock<Regex> = OnceLock::new();
-    let pat = PATH.get_or_init(|| Regex::new("^GET (/[^ ]*) HTTP/1.1$").unwrap());
-    Ok(pat.captures(&line).ok_or(RequestParsingError)?[1].to_owned())
-}
-
-fn parse_header(line: String) -> Result<(String, String), ConnectionError> {
-    static HEADER: OnceLock<Regex> = OnceLock::new();
-    let pat = HEADER.get_or_init(|| Regex::new("^([^ ]+): (.+)$").unwrap());
-    let caps = pat.captures(&line).ok_or(RequestParsingError)?;
-    Ok((caps[1].to_owned(), caps[2].to_owned()))
-}
-
-fn parse_request(reader: &mut dyn BufRead) -> Result<Request<'_>, ConnectionError> {
-    let mut lines = reader.lines();
-
-    let path = parse_path(lines.next().ok_or(RequestParsingError)??)?;
-    let headers = lines
-        .take_while(|line| line.as_ref().map(|s| !s.is_empty()).unwrap_or(false))
-        .map(|line| line.map_err(|err| err.into()).and_then(parse_header))
-        .collect::<Result<Vec<(String, String)>, _>>()?;
-
-    Ok(Request { path, headers, body: reader, matches: None })
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
