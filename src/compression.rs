@@ -20,10 +20,6 @@ impl Display for DecompressionError {
 
 impl Error for DecompressionError {}
 
-enum CompressionScheme {
-    Gzip,
-}
-
 pub struct CompressionFactory;
 
 impl MiddlewareFactory for CompressionFactory {
