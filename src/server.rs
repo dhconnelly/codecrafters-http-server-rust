@@ -1,17 +1,16 @@
 use crate::{
-    parse_request, thread_pool::ThreadPool, Body, Context, Handler, HttpError, Request,
-    RequestParsingError, Response,
+    parse_request, thread_pool::ThreadPool, Body, Context, Handler, HttpError, RequestParsingError,
+    Response,
 };
 use clap::Parser;
-use regex::Regex;
 use std::{
     env,
     error::Error,
     fmt::Display,
-    io::{self, BufRead, BufReader, BufWriter, Write},
+    io::{self, BufReader, BufWriter, Write},
     net::{TcpListener, TcpStream},
     path::PathBuf,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -196,7 +195,7 @@ impl Server {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::HttpStatus;
+    use crate::{HttpStatus, Request};
     use std::{sync::Arc, thread};
 
     // TODO: test out of order lifecycle calls

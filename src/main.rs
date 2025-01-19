@@ -110,8 +110,7 @@ mod test {
     use super::*;
 
     fn make_server() -> Arc<Server> {
-        let mut config = Config::default();
-        config.port = 0;
+        let config = Config::default();
         let handler = codecrafters_handler();
         Arc::new(Server::start(config, handler))
     }
